@@ -1,8 +1,11 @@
 <template>
   <div class="iq-talk-wrapper">
+    <!-- Hidden player to handle the live MSE stream -->
+    <audio ref="liveAudioPlayer" autoplay></audio>
+
     <div v-if="!hasJoined" class="join-wrap">
       <div class="join-logo">IQ<span>Talk</span></div>
-      <div class="join-tag">Socket Store & Forward Edition</div>
+      <div class="join-tag">Real-Time Chunking Edition</div>
       <div class="join-card">
         <div class="field-label">Your name</div>
         <input 
@@ -119,7 +122,7 @@
           @touchend.prevent="stopTalk"
         >
           <span>🎙️</span>
-          <span v-if="isTalking">Recording… (Release to Send)</span>
+          <span v-if="isTalking">Live Transmitting...</span>
           <span v-else-if="talkMode !== 'none'">Hold to Talk</span>
           <span v-else>Select Target</span>
           
@@ -145,25 +148,29 @@ export default {
       newTeamName: "",
       activeTab: "people",
       
-      // Socket & Media
+      // Socket & Media Sender
       socket: null,
       mySocketId: null,
       localStream: null,
       mediaRecorder: null,
-      audioChunks: [],
-      mimeType: "audio/webm",
+      mimeType: 'audio/webm; codecs="opus"', // Force standard codec for MSE
       
       // Data Stores
       onlineUsers: [],
       teamsList: [],
-      myTeamIds: [], // Array of teamIds I have joined
-      talkingIds: [], // Array of socketIds currently talking
+      myTeamIds: [],
+      talkingIds: [], 
       
       // PTT Context
       isTalking: false,
-      talkMode: "none", // 'none' | 'user' | 'team'
+      talkMode: "none",
       targetId: null,
-      targetName: null
+      targetName: null,
+
+      // Receiver Stream Components
+      mediaSource: null,
+      sourceBuffer: null,
+      audioQueue: [] // Queue to hold chunks while the buffer is parsing
     };
   },
   computed: {
@@ -206,9 +213,12 @@ export default {
     async setupAudioCapture() {
       try {
         this.localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        if (MediaRecorder.isTypeSupported('audio/webm')) this.mimeType = 'audio/webm';
-        else if (MediaRecorder.isTypeSupported('audio/ogg')) this.mimeType = 'audio/ogg';
-        else this.mimeType = 'audio/mp4';
+        
+        // Ensure Safari compatibility or fallback
+        if (!MediaRecorder.isTypeSupported(this.mimeType)) {
+            if (MediaRecorder.isTypeSupported('audio/mp4')) this.mimeType = 'audio/mp4';
+            else this.mimeType = ''; // Let browser decide, MSE might be tricky here
+        }
         return true;
       } catch (e) {
         alert("Microphone access denied. PTT will not work.");
@@ -217,8 +227,7 @@ export default {
     },
 
     initNetwork() {
-      // Connect to Socket.io Server (Update URL if hosting externally)
-      this.socket = io(process.env.VUE_APP_SERVER_URL || "http://localhost:8080");
+      this.socket = io(process.env.VUE_APP_SERVER_URL || "http://localhost:3000");
 
       this.socket.on('connect', () => {
         this.mySocketId = this.socket.id;
@@ -240,20 +249,66 @@ export default {
         this.setContext('team', teamId, teamName);
       });
 
-      this.socket.on('receive-audio', (payload) => {
-        const { audioBlob, mimeType } = payload;
-        const blob = new Blob([audioBlob], { type: mimeType });
-        const audioUrl = URL.createObjectURL(blob);
-        const audio = new Audio(audioUrl);
-        audio.play().catch(e => console.warn("Auto-play blocked:", e));
-      });
-
-      this.socket.on('ptt-started', ({ senderId }) => {
+      // ─── STREAM RECEIVING LOGIC ───
+      this.socket.on('incoming-stream-start', (payload) => {
+        const { senderId, mimeType } = payload;
+        
+        // Update UI Indicator
         if (!this.talkingIds.includes(senderId)) this.talkingIds.push(senderId);
+
+        // Setup Media Source Extension (Bucket)
+        this.mediaSource = new MediaSource();
+        this.$refs.liveAudioPlayer.src = URL.createObjectURL(this.mediaSource);
+        this.audioQueue = [];
+
+        this.mediaSource.addEventListener('sourceopen', () => {
+          try {
+            this.sourceBuffer = this.mediaSource.addSourceBuffer(mimeType);
+            
+            // Consume from the queue continuously as the buffer finishes parsing chunks
+            this.sourceBuffer.addEventListener('updateend', () => {
+              if (this.audioQueue.length > 0 && !this.sourceBuffer.updating) {
+                this.sourceBuffer.appendBuffer(this.audioQueue.shift());
+              }
+            });
+          } catch (e) {
+            console.error("MSE Buffer Setup Error (Codec mismatch?):", e);
+          }
+        });
       });
 
-      this.socket.on('ptt-stopped', ({ senderId }) => {
+      this.socket.on('incoming-stream-chunk', (payload) => {
+        const { audioChunk } = payload; // Arrives as ArrayBuffer
+        
+        if (this.sourceBuffer && this.mediaSource.readyState === 'open') {
+          if (!this.sourceBuffer.updating) {
+            // Buffer is free, parse chunk instantly
+            this.sourceBuffer.appendBuffer(audioChunk);
+          } else {
+            // Buffer is busy parsing previous chunk, queue this one
+            this.audioQueue.push(audioChunk);
+          }
+        } else {
+          // Source not fully open yet, store the chunks safely
+          this.audioQueue.push(audioChunk);
+        }
+      });
+
+      this.socket.on('incoming-stream-stop', (payload) => {
+        const { senderId } = payload;
+        
+        // Update UI
         this.talkingIds = this.talkingIds.filter(id => id !== senderId);
+
+        // Close the MSE stream
+        if (this.mediaSource && this.mediaSource.readyState === 'open') {
+          try {
+            this.mediaSource.endOfStream();
+          } catch(e) { 
+            console.error("Error to play audio: ",e);
+            
+          }
+        }
       });
     },
 
@@ -272,7 +327,7 @@ export default {
       if (this.targetId === teamId) this.setContext('none', null, null);
     },
 
-    // ─── PTT LOGIC ─────────────────────────────────────────────────────
+    // ─── PTT LOGIC (SENDER) ────────────────────────────────────────────
     setContext(mode, id, name) {
       this.talkMode = mode;
       this.targetId = id;
@@ -283,26 +338,27 @@ export default {
       if (this.isTalking || this.talkMode === 'none' || !this.localStream) return;
 
       this.isTalking = true;
-      this.audioChunks = [];
-      
       this.mediaRecorder = new MediaRecorder(this.localStream, { mimeType: this.mimeType });
       
+      this.socket.emit('stream-start', { 
+        targetType: this.talkMode, 
+        targetId: this.targetId,
+        mimeType: this.mimeType 
+      });
+      
       this.mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) this.audioChunks.push(event.data);
+        if (event.data.size > 0) {
+          // Emit the chunk instantly as binary Blob
+          this.socket.emit('stream-chunk', {
+            targetType: this.talkMode,
+            targetId: this.targetId,
+            audioChunk: event.data
+          });
+        }
       };
       
-      this.mediaRecorder.onstop = () => {
-        const audioBlob = new Blob(this.audioChunks, { type: this.mimeType });
-        this.socket.emit('transmit-audio', {
-          targetType: this.talkMode,
-          targetId: this.targetId,
-          audioBlob: audioBlob,
-          mimeType: this.mimeType
-        });
-      };
-
-      this.mediaRecorder.start();
-      this.socket.emit('ptt-start', { targetType: this.talkMode, targetId: this.targetId });
+      // The crucial step for streaming: timeslice! Fire event every 250ms
+      this.mediaRecorder.start(250); 
     },
 
     stopTalk() {
@@ -313,7 +369,7 @@ export default {
         this.mediaRecorder.stop();
       }
       
-      this.socket.emit('ptt-stop', { targetType: this.talkMode, targetId: this.targetId });
+      this.socket.emit('stream-stop', { targetType: this.talkMode, targetId: this.targetId });
     }
   },
   beforeDestroy() {
@@ -324,7 +380,6 @@ export default {
 </script>
 
 <style scoped>
-/* ── ALL CSS REMAINS IDENTICAL TO YOUR PROTOTYPE ── */
 * { box-sizing: border-box; margin: 0; padding: 0; }
 .iq-talk-wrapper { font-family: system-ui, -apple-system, sans-serif; background: #0f1117; color: #e8e8e8; height: 100vh; overflow: hidden; }
 
