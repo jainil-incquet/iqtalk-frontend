@@ -218,7 +218,7 @@ export default {
 
     initNetwork() {
       // Connect to Socket.io Server (Update URL if hosting externally)
-      this.socket = io("http://localhost:3000");
+      this.socket = io(process.env.VUE_APP_SERVER_URL || "http://localhost:8080");
 
       this.socket.on('connect', () => {
         this.mySocketId = this.socket.id;
